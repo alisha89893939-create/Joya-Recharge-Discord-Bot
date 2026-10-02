@@ -1,270 +1,254 @@
-const admin = require("firebase-admin");
 
+const express = require("express");
 const {
   Client,
   GatewayIntentBits,
-  Events,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder
 } = require("discord.js");
+const admin = require("firebase-admin");
 
-// =====================================================
-// CONFIG
-// =====================================================
-
+const PORT = process.env.PORT || 10000;
 const TOKEN = process.env.DISCORD_TOKEN;
 
-const CHANNEL_NAME = "add-money-alert";
+function fixKey(v) {
+  if (!v) return "";
 
-const DATABASE_URL =
-  "https://zoya-recharge-2-default-rtdb.firebaseio.com";
+  let s = String(v).trim();
 
-// =====================================================
-// ENV CHECK
-// =====================================================
+  if (s.startsWith("{")) {
+    try {
+      const j = JSON.parse(s);
+      if (j.private_key) {
+        return String(j.private_key).replace(/\\n/g, "\n");
+      }
+    } catch (_) {}
+  }
+
+  return s
+    .replace(/^"(.*)"$/s, "$1")
+    .replace(/\\n/g, "\n");
+}
+
+function firebaseCredential() {
+  const whole =
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+    process.env.FIREBASE_SERVICE_ACCOUNT;
+
+  if (whole && whole.trim()) {
+    try {
+      return admin.credential.cert(JSON.parse(whole));
+    } catch (_) {}
+
+    try {
+      return admin.credential.cert(
+        JSON.parse(
+          Buffer.from(whole.trim(), "base64").toString("utf8")
+        )
+      );
+    } catch (_) {}
+  }
+
+  const projectId =
+    process.env.FIREBASE_PROJECT_ID || "zoya-recharge-2";
+
+  const clientEmail =
+    process.env.FIREBASE_CLIENT_EMAIL || "";
+
+  const privateKey =
+    fixKey(process.env.FIREBASE_PRIVATE_KEY || "");
+
+  if (!clientEmail || !privateKey) {
+    throw new Error(
+      "Set FIREBASE_SERVICE_ACCOUNT_JSON OR FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY."
+    );
+  }
+
+  if (!privateKey.includes("BEGIN PRIVATE KEY")) {
+    throw new Error(
+      "FIREBASE_PRIVATE_KEY must contain BEGIN PRIVATE KEY and END PRIVATE KEY."
+    );
+  }
+
+  return admin.credential.cert({
+    projectId,
+    clientEmail,
+    privateKey
+  });
+}
 
 if (!TOKEN) {
   console.error("DISCORD_TOKEN is missing");
   process.exit(1);
 }
 
-if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-  console.error("FIREBASE_SERVICE_ACCOUNT_JSON is missing");
-  process.exit(1);
-}
-
-// =====================================================
-// FIREBASE SERVICE ACCOUNT
-// =====================================================
-
-let serviceAccount;
-
-try {
-  serviceAccount = JSON.parse(
-    process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-  );
-
-  // Important fix for Render / Firebase private key
-  if (serviceAccount.private_key) {
-    serviceAccount.private_key = String(
-      serviceAccount.private_key
-    )
-      .replace(/\\n/g, "\n")
-      .replace(/\r\n/g, "\n")
-      .trim();
-  }
-
-  if (
-    !serviceAccount.project_id ||
-    !serviceAccount.client_email ||
-    !serviceAccount.private_key
-  ) {
-    throw new Error(
-      "Firebase service account JSON is missing project_id, client_email or private_key"
-    );
-  }
-} catch (error) {
-  console.error(
-    "Firebase service account JSON error:",
-    error.message
-  );
-  process.exit(1);
-}
-
-// =====================================================
-// FIREBASE INIT
-// =====================================================
+let db;
 
 try {
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: DATABASE_URL
+    credential: firebaseCredential(),
+    databaseURL:
+      process.env.FIREBASE_DATABASE_URL ||
+      "https://zoya-recharge-2-default-rtdb.firebaseio.com"
   });
 
-  console.log("Firebase initialized successfully");
-} catch (error) {
+  db = admin.database();
+
+  console.log("Firebase initialized successfully.");
+} catch (e) {
   console.error(
     "Firebase initialization failed:",
-    error.message
+    e.message
   );
   process.exit(1);
 }
 
-const db = admin.database();
+const web = express();
 
-// =====================================================
-// DISCORD CLIENT
-// =====================================================
+web.get("/", (_req, res) => {
+  res
+    .status(200)
+    .send("Joya Recharge Discord Bot is running.");
+});
+
+web.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+web.listen(PORT, "0.0.0.0", () => {
+  console.log("Health server on port " + PORT);
+});
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-// =====================================================
-// HELPERS
-// =====================================================
+const CHANNEL_ID =
+  process.env.DISCORD_CHANNEL_ID || "";
 
-function pick(obj, keys, fallback = "") {
-  if (!obj || typeof obj !== "object") {
-    return fallback;
-  }
+const seen = new Set();
 
-  for (const key of keys) {
+function pick(o, keys, fallback = "") {
+  for (const k of keys) {
     if (
-      obj[key] !== undefined &&
-      obj[key] !== null &&
-      String(obj[key]).trim() !== ""
+      o &&
+      o[k] !== undefined &&
+      o[k] !== null &&
+      o[k] !== ""
     ) {
-      return obj[key];
+      return o[k];
     }
   }
 
   return fallback;
 }
 
-function num(value) {
+function amount(d) {
   const n = Number(
-    String(value ?? "").replace(/[^0-9.-]/g, "")
+    pick(
+      d,
+      ["amount", "requestAmount", "money", "price"],
+      0
+    )
   );
 
   return Number.isFinite(n) ? n : 0;
 }
 
-function isPending(data) {
-  const status = String(
+function mobile(d) {
+  return String(
     pick(
-      data,
-      ["status", "requestStatus", "state"],
-      "pending"
+      d,
+      ["mobile", "mobileNumber", "phone", "number"],
+      ""
     )
-  ).toLowerCase();
-
-  return ![
-    "approved",
-    "accepted",
-    "success",
-    "successful",
-    "rejected",
-    "declined",
-    "failed",
-    "cancelled",
-    "canceled"
-  ].includes(status);
+  ).trim();
 }
 
-// =====================================================
-// REQUEST FORMAT
-// =====================================================
-
-function makeRequest(key, data) {
-  return {
-    key,
-
-    data,
-
-    userId: String(
-      pick(
-        data,
-        ["userId", "uid", "user_id", "userid"],
-        ""
-      )
-    ),
-
-    mobile: String(
-      pick(
-        data,
-        [
-          "mobile",
-          "phone",
-          "number",
-          "mobileNumber",
-          "phoneNumber"
-        ],
-        ""
-      )
-    ),
-
-    name: String(
-      pick(
-        data,
-        [
-          "name",
-          "userName",
-          "username",
-          "customerName"
-        ],
-        ""
-      )
-    ),
-
-    amount: num(
-      pick(
-        data,
-        ["amount", "money", "requestAmount"],
-        0
-      )
-    ),
-
-    utr: String(
-      pick(
-        data,
-        [
-          "utr",
-          "UTR",
-          "utrNumber",
-          "reference",
-          "referenceNumber",
-          "transactionId",
-          "txnId"
-        ],
-        ""
-      )
+function name(d) {
+  return String(
+    pick(
+      d,
+      ["name", "userName", "fullName"],
+      "User"
     )
-  };
+  ).trim();
 }
 
-// =====================================================
-// FIND USER
-// =====================================================
+function utr(d) {
+  return String(
+    pick(
+      d,
+      [
+        "utr",
+        "utrNumber",
+        "transactionId",
+        "txnId",
+        "referenceNumber",
+        "ref"
+      ],
+      ""
+    )
+  ).trim();
+}
 
-async function findUser(request) {
-  const snapshot = await db.ref("users").once("value");
+function pending(d) {
+  return [
+    "pending",
+    "requested",
+    "processing",
+    "new",
+    "waiting",
+    "under_review"
+  ].includes(
+    String(
+      pick(
+        d,
+        ["status", "requestStatus", "paymentStatus"],
+        "pending"
+      )
+    ).toLowerCase()
+  );
+}
 
-  const users = snapshot.val() || {};
+async function findUser(data) {
+  const uid = pick(data, ["userId", "uid"], "");
 
-  // First try user ID
-  if (request.userId && users[request.userId]) {
-    return {
-      key: request.userId,
-      data: users[request.userId]
-    };
+  if (uid) {
+    const s = await db
+      .ref("users/" + uid)
+      .get();
+
+    if (s.exists()) {
+      return {
+        key: uid,
+        data: s.val()
+      };
+    }
   }
 
-  // Then try mobile number
-  for (const [key, data] of Object.entries(users)) {
-    const mobile = String(
-      pick(
-        data,
-        [
-          "mobile",
-          "phone",
-          "number",
-          "mobileNumber",
-          "phoneNumber"
-        ],
-        ""
-      )
-    );
+  const m = mobile(data);
 
+  if (!m) return null;
+
+  const s = await db.ref("users").get();
+  const users = s.val() || {};
+
+  for (const [key, u] of Object.entries(users)) {
     if (
-      request.mobile &&
-      mobile === request.mobile
+      String(
+        pick(
+          u,
+          ["mobile", "mobileNumber", "phone", "number"],
+          ""
+        )
+      ) === m
     ) {
       return {
         key,
-        data
+        data: u
       };
     }
   }
@@ -272,560 +256,307 @@ async function findUser(request) {
   return null;
 }
 
-// =====================================================
-// WALLET
-// =====================================================
+async function acceptRequest(key, data) {
+  const n = amount(data);
 
-function getWallet(data) {
-  return num(
-    pick(
-      data,
-      [
-        "balance",
-        "wallet",
-        "walletBalance",
-        "money"
-      ],
-      0
+  if (!(n > 0)) {
+    throw new Error("Invalid amount.");
+  }
+
+  const u = await findUser(data);
+
+  if (!u) {
+    throw new Error("User not found.");
+  }
+
+  const result = await db
+    .ref("users/" + u.key)
+    .transaction(cur => {
+      if (!cur) return cur;
+
+      const old = Number(
+        cur.balance ??
+        cur.wallet ??
+        cur.walletBalance ??
+        0
+      );
+
+      const next = old + n;
+
+      return {
+        ...cur,
+        balance: next,
+        wallet: next,
+        walletBalance: next,
+        updatedAt: Date.now()
+      };
+    });
+
+  if (!result.committed) {
+    throw new Error(
+      "Wallet update was not committed."
+    );
+  }
+
+  await db
+    .ref("add_history/" + key)
+    .update({
+      status: "accepted",
+      approved: true,
+      processed: true,
+      processedAt: Date.now(),
+      processedBy:
+        "Joya Recharge Discord Bot"
+    });
+
+  return result.snapshot.val().balance;
+}
+
+async function rejectRequest(key) {
+  await db
+    .ref("add_history/" + key)
+    .update({
+      status: "rejected",
+      approved: false,
+      processed: true,
+      processedAt: Date.now(),
+      processedBy:
+        "Joya Recharge Discord Bot"
+    });
+}
+
+function embed(key, d) {
+  return new EmbedBuilder()
+    .setTitle("💰 New Add Money Request")
+    .setDescription(
+      "A new wallet top-up request is waiting for admin action."
     )
+    .addFields(
+      {
+        name: "👤 Name",
+        value: name(d),
+        inline: true
+      },
+      {
+        name: "📱 Mobile",
+        value: mobile(d) || "Not provided",
+        inline: true
+      },
+      {
+        name: "💵 Amount",
+        value: "₹" + amount(d),
+        inline: true
+      },
+      {
+        name: "🔖 UTR / Reference",
+        value: utr(d) || "Not provided",
+        inline: false
+      },
+      {
+        name: "🆔 Request ID",
+        value: String(key),
+        inline: false
+      }
+    )
+    .setTimestamp();
+}
+
+function row(key) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("accept:" + key)
+      .setLabel("ACCEPT")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("reject:" + key)
+      .setLabel("REJECT")
+      .setStyle(ButtonStyle.Danger)
   );
 }
 
-// =====================================================
-// DISCORD CHANNEL
-// =====================================================
+async function channel() {
+  if (CHANNEL_ID) {
+    const c = await client.channels
+      .fetch(CHANNEL_ID)
+      .catch(() => null);
 
-async function getChannel() {
-  const guilds = client.guilds.cache;
+    if (c && c.isTextBased()) {
+      return c;
+    }
+  }
 
-  for (const guild of guilds.values()) {
-    const channel = guild.channels.cache.find(
-      ch =>
-        ch.name === CHANNEL_NAME &&
-        ch.isTextBased()
+  for (const g of client.guilds.cache.values()) {
+    const c = g.channels.cache.find(
+      x =>
+        x.isTextBased() &&
+        x.name === "add-money-alert"
     );
 
-    if (channel) {
-      return channel;
-    }
+    if (c) return c;
+  }
+
+  for (const g of client.guilds.cache.values()) {
+    const c = g.channels.cache.find(
+      x => x.isTextBased()
+    );
+
+    if (c) return c;
   }
 
   return null;
 }
 
-// =====================================================
-// ALERT MESSAGE
-// =====================================================
-
-function alertMessage(request) {
-  const embed = new EmbedBuilder()
-    .setTitle("💰 NEW ADD MONEY REQUEST")
-    .setDescription(
-      "A new wallet add-money request has been received."
-    )
-    .addFields(
-      {
-        name: "👤 Name",
-        value: request.name || "Not provided",
-        inline: true
-      },
-      {
-        name: "📱 Mobile",
-        value: request.mobile || "Not provided",
-        inline: true
-      },
-      {
-        name: "💵 Amount",
-        value: `₹${request.amount.toFixed(2)}`,
-        inline: true
-      },
-      {
-        name: "🔢 UTR / Reference",
-        value: request.utr || "Not provided",
-        inline: false
-      },
-      {
-        name: "🆔 Request ID",
-        value: String(request.key),
-        inline: false
-      }
-    )
-    .setFooter({
-      text: "Joya Recharge Admin"
-    })
-    .setTimestamp();
-
-  const buttons =
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`ACCEPT:${request.key}`)
-        .setLabel("ACCEPT")
-        .setStyle(ButtonStyle.Success),
-
-      new ButtonBuilder()
-        .setCustomId(`REJECT:${request.key}`)
-        .setLabel("REJECT")
-        .setStyle(ButtonStyle.Danger)
-    );
-
-  return {
-    embeds: [embed],
-    components: [buttons]
-  };
-}
-
-// =====================================================
-// CHECK IF ALREADY PROCESSED
-// =====================================================
-
-async function exists(key) {
-  const snapshot = await db
-    .ref(`add_history/${key}`)
-    .once("value");
-
-  const data = snapshot.val();
-
-  if (!data) {
-    return false;
-  }
-
-  const status = String(
-    pick(
-      data,
-      ["status", "requestStatus", "state"],
-      "pending"
-    )
-  ).toLowerCase();
-
-  return [
-    "approved",
-    "accepted",
-    "success",
-    "successful",
-    "rejected",
-    "declined",
-    "failed",
-    "cancelled",
-    "canceled"
-  ].includes(status);
-}
-
-// =====================================================
-// SEND REQUEST TO DISCORD
-// =====================================================
-
-async function sendRequest(key, data) {
+async function scan() {
   try {
-    if (!isPending(data)) {
-      return;
-    }
+    const s = await db
+      .ref("add_history")
+      .get();
 
-    // Do not send duplicate processed request
-    if (await exists(key)) {
-      return;
-    }
+    if (!s.exists()) return;
 
-    const channel = await getChannel();
+    for (const [key, d] of Object.entries(
+      s.val() || {}
+    )) {
+      if (
+        !d ||
+        !pending(d) ||
+        seen.has(key)
+      ) {
+        continue;
+      }
 
-    if (!channel) {
-      console.error(
-        `Discord channel #${CHANNEL_NAME} not found`
-      );
-      return;
-    }
+      const c = await channel();
 
-    const request = makeRequest(key, data);
+      if (!c) {
+        console.error(
+          "No Discord text channel available."
+        );
+        return;
+      }
 
-    const message = await channel.send(
-      alertMessage(request)
-    );
-
-    // Save Discord message information
-    await db
-      .ref(`add_history/${key}`)
-      .update({
-        discordMessageId: message.id,
-        discordChannelId: channel.id,
-        discordSentAt:
-          admin.database.ServerValue.TIMESTAMP
+      await c.send({
+        content:
+          "🔔 **NEW ADD MONEY REQUEST**",
+        embeds: [embed(key, d)],
+        components: [row(key)]
       });
 
-    console.log(
-      `Add Money request sent to Discord: ${key}`
-    );
-  } catch (error) {
-    console.error(
-      "sendRequest error:",
-      error
-    );
-  }
-}
+      seen.add(key);
 
-// =====================================================
-// ACCEPT REQUEST
-// =====================================================
-
-async function acceptRequest(key, interaction) {
-  const ref = db.ref(`add_history/${key}`);
-
-  const snapshot = await ref.once("value");
-
-  if (!snapshot.exists()) {
-    return {
-      ok: false,
-      message: "Request not found."
-    };
-  }
-
-  const requestData = snapshot.val();
-
-  if (!isPending(requestData)) {
-    return {
-      ok: false,
-      message: "This request has already been processed."
-    };
-  }
-
-  const request = makeRequest(
-    key,
-    requestData
-  );
-
-  if (request.amount <= 0) {
-    return {
-      ok: false,
-      message: "Invalid request amount."
-    };
-  }
-
-  const user = await findUser(request);
-
-  if (!user) {
-    return {
-      ok: false,
-      message:
-        "User not found. Wallet was not updated."
-    };
-  }
-
-  const oldWallet = getWallet(user.data);
-
-  const newWallet =
-    oldWallet + request.amount;
-
-  // Update wallet
-  await db
-    .ref(`users/${user.key}`)
-    .update({
-      balance: newWallet,
-      wallet: newWallet
-    });
-
-  // Mark request approved
-  await ref.update({
-    status: "approved",
-    approved: true,
-    approvedBy: interaction.user.tag,
-    processedAt:
-      admin.database.ServerValue.TIMESTAMP,
-    oldWallet: oldWallet,
-    addedAmount: request.amount,
-    newWallet: newWallet
-  });
-
-  return {
-    ok: true,
-    amount: request.amount,
-    oldWallet,
-    newWallet,
-    userKey: user.key
-  };
-}
-
-// =====================================================
-// REJECT REQUEST
-// =====================================================
-
-async function rejectRequest(key, interaction) {
-  const ref = db.ref(`add_history/${key}`);
-
-  const snapshot = await ref.once("value");
-
-  if (!snapshot.exists()) {
-    return {
-      ok: false,
-      message: "Request not found."
-    };
-  }
-
-  const data = snapshot.val();
-
-  if (!isPending(data)) {
-    return {
-      ok: false,
-      message: "This request has already been processed."
-    };
-  }
-
-  await ref.update({
-    status: "rejected",
-    rejectedBy: interaction.user.tag,
-    processedAt:
-      admin.database.ServerValue.TIMESTAMP
-  });
-
-  return {
-    ok: true
-  };
-}
-
-// =====================================================
-// BOT READY
-// =====================================================
-
-client.once(
-  Events.ClientReady,
-  async bot => {
-    console.log(
-      `Discord bot logged in as ${bot.user.tag}`
-    );
-
-    console.log(
-      `Watching Firebase /add_history`
-    );
-
-    console.log(
-      `Discord channel: #${CHANNEL_NAME}`
-    );
-
-    // Existing requests
-    try {
-      const ref = db.ref("add_history");
-
-      const snapshot =
-        await ref.once("value");
-
-      const data =
-        snapshot.val() || {};
-
-      for (
-        const [key, value]
-        of Object.entries(data)
-      ) {
-        if (isPending(value)) {
-          await sendRequest(key, value);
-        }
-      }
-    } catch (error) {
-      console.error(
-        "Existing request scan error:",
-        error
+      console.log(
+        "Sent alert for " + key
       );
     }
-
-    // New requests
-    const ref = db.ref("add_history");
-
-    ref.on(
-      "child_added",
-      async snapshot => {
-        try {
-          const key = snapshot.key;
-          const data = snapshot.val();
-
-          if (!key || !data) {
-            return;
-          }
-
-          if (!isPending(data)) {
-            return;
-          }
-
-          await sendRequest(
-            key,
-            data
-          );
-        } catch (error) {
-          console.error(
-            "child_added error:",
-            error
-          );
-        }
-      }
-    );
-
-    console.log(
-      "Firebase listener started successfully"
+  } catch (e) {
+    console.error(
+      "Firebase scan failed:",
+      e.message
     );
   }
-);
+}
 
-// =====================================================
-// DISCORD BUTTONS
-// =====================================================
+client.once("ready", async () => {
+  console.log(
+    "Discord logged in as " +
+    client.user.tag
+  );
+
+  await scan();
+
+  setInterval(scan, 5000);
+});
 
 client.on(
-  Events.InteractionCreate,
+  "interactionCreate",
   async interaction => {
-    if (!interaction.isButton()) {
-      return;
-    }
+    if (!interaction.isButton()) return;
 
-    const parts =
+    const [action, key] =
       interaction.customId.split(":");
 
-    const action = parts[0];
-
-    const key =
-      parts.slice(1).join(":");
-
-    if (!key) {
-      return;
-    }
+    if (!key) return;
 
     await interaction.deferUpdate();
 
     try {
-      // ===============================================
-      // ACCEPT
-      // ===============================================
+      const s = await db
+        .ref("add_history/" + key)
+        .get();
 
-      if (action === "ACCEPT") {
-        const result =
-          await acceptRequest(
-            key,
-            interaction
-          );
+      if (!s.exists()) {
+        throw new Error(
+          "Request not found in Firebase."
+        );
+      }
 
-        if (!result.ok) {
-          await interaction.editReply({
-            content:
-              `⚠️ ${result.message}`,
-            embeds: [],
-            components: []
-          });
+      const d = s.val();
 
-          return;
-        }
-
+      if (!pending(d)) {
         await interaction.editReply({
           content:
-            `✅ ACCEPTED\n\n` +
-            `💰 ₹${result.amount.toFixed(2)} ` +
-            `wallet में add किया गया।\n\n` +
-            `💳 Old Wallet: ₹${result.oldWallet.toFixed(2)}\n` +
-            `💳 New Wallet: ₹${result.newWallet.toFixed(2)}\n\n` +
-            `👮 Approved by: ${interaction.user.tag}`,
-          embeds: [],
+            "⚠️ This request is already processed.",
           components: []
         });
-
-        console.log(
-          `ACCEPTED ${key} ₹${result.amount}`
-        );
 
         return;
       }
 
-      // ===============================================
-      // REJECT
-      // ===============================================
-
-      if (action === "REJECT") {
-        const result =
-          await rejectRequest(
-            key,
-            interaction
-          );
-
-        if (!result.ok) {
-          await interaction.editReply({
-            content:
-              `⚠️ ${result.message}`,
-            embeds: [],
-            components: []
-          });
-
-          return;
-        }
+      if (action === "accept") {
+        const balance =
+          await acceptRequest(key, d);
 
         await interaction.editReply({
           content:
-            `❌ REJECTED\n\n` +
-            `Add Money request reject कर दिया गया।\n\n` +
-            `👮 Rejected by: ${interaction.user.tag}`,
-          embeds: [],
+            "✅ **ACCEPTED** — ₹" +
+            amount(d) +
+            " added to wallet. New balance: ₹" +
+            balance,
+          embeds: [
+            embed(key, {
+              ...d,
+              status: "accepted"
+            })
+          ],
           components: []
         });
-
-        console.log(
-          `REJECTED ${key}`
-        );
-
-        return;
       }
-    } catch (error) {
+
+      if (action === "reject") {
+        await rejectRequest(key);
+
+        await interaction.editReply({
+          content:
+            "❌ **REJECTED** — Request marked rejected in Firebase.",
+          embeds: [
+            embed(key, {
+              ...d,
+              status: "rejected"
+            })
+          ],
+          components: []
+        });
+      }
+    } catch (e) {
       console.error(
-        "Button processing error:",
-        error
+        "Button error:",
+        e.message
       );
 
-      try {
-        await interaction.editReply({
-          content:
-            `⚠️ Error: ${error.message}`,
-          embeds: [],
-          components: []
-        });
-      } catch (_) {}
+      await interaction
+        .followUp({
+          content: "❌ " + e.message,
+          ephemeral: true
+        })
+        .catch(() => {});
     }
   }
 );
 
-// =====================================================
-// ERROR HANDLERS
-// =====================================================
-
-client.on(
-  "error",
-  error => {
-    console.error(
-      "Discord client error:",
-      error
-    );
-  }
-);
-
-process.on(
-  "unhandledRejection",
-  error => {
-    console.error(
-      "Unhandled rejection:",
-      error
-    );
-  }
-);
-
-process.on(
-  "uncaughtException",
-  error => {
-    console.error(
-      "Uncaught exception:",
-      error
-    );
-  }
-);
-
-// =====================================================
-// LOGIN
-// =====================================================
-
-console.log("Starting Joya Recharge Discord Bot...");
-
-client.login(TOKEN).catch(error => {
+client.login(TOKEN).catch(e => {
   console.error(
     "Discord login failed:",
-    error.message
+    e.message
   );
 
   process.exit(1);
