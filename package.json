@@ -1,12 +1,16 @@
 {
   "name": "joya-recharge-discord-bot",
   "version": "1.0.0",
+  "description": "Joya Recharge Add Money Discord alert bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "firebase-admin": "^13.0.1"
+    "firebase-admin": "^13.0.0"
   }
-}
+
