@@ -1,4 +1,5 @@
 const admin = require("firebase-admin");
+
 const {
   Client,
   GatewayIntentBits,
@@ -10,9 +11,17 @@ const {
 } = require("discord.js");
 
 const TOKEN = process.env.DISCORD_TOKEN;
+
 const CHANNEL_NAME = "add-money-alert";
+
 const DATABASE_URL =
+  process.env.FIREBASE_DATABASE_URL ||
   "https://zoya-recharge-2-default-rtdb.firebaseio.com";
+
+
+/* =========================
+   CHECK ENVIRONMENT VARIABLES
+========================= */
 
 if (!TOKEN) {
   console.error("DISCORD_TOKEN is missing");
@@ -24,39 +33,90 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   process.exit(1);
 }
 
+
+/* =========================
+   FIREBASE SERVICE ACCOUNT
+========================= */
+
 let serviceAccount;
 
 try {
   serviceAccount = JSON.parse(
     process.env.FIREBASE_SERVICE_ACCOUNT_JSON
   );
-
-  // Firebase private key में escaped \n को real newline में बदलना
-  if (serviceAccount.private_key) {
-    serviceAccount.private_key =
-      serviceAccount.private_key.replace(/\\n/g, "\n");
-  }
 } catch (error) {
   console.error(
     "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON:",
     error.message
   );
+
   process.exit(1);
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: DATABASE_URL
-});
+
+if (
+  !serviceAccount.project_id ||
+  !serviceAccount.client_email ||
+  !serviceAccount.private_key
+) {
+  console.error(
+    "Firebase service account JSON must contain project_id, client_email and private_key."
+  );
+
+  process.exit(1);
+}
+
+
+/*
+  Render environment variables can contain
+  literal \n instead of real line breaks.
+*/
+
+serviceAccount.private_key =
+  serviceAccount.private_key.replace(/\\n/g, "\n");
+
+
+/* =========================
+   INITIALIZE FIREBASE
+========================= */
+
+try {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: DATABASE_URL
+  });
+} catch (error) {
+  console.error(
+    "Firebase initialization failed:",
+    error.message
+  );
+
+  process.exit(1);
+}
+
 
 const db = admin.database();
 
+
+/* =========================
+   DISCORD CLIENT
+========================= */
+
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [
+    GatewayIntentBits.Guilds
+  ]
 });
 
+
+/* =========================
+   HELPER FUNCTIONS
+========================= */
+
 function pick(obj, keys, fallback = "") {
+
   for (const key of keys) {
+
     if (
       obj &&
       obj[key] !== undefined &&
@@ -65,27 +125,38 @@ function pick(obj, keys, fallback = "") {
     ) {
       return obj[key];
     }
+
   }
 
   return fallback;
 }
 
-function num(v) {
+
+function num(value) {
+
   const n = Number(
-    String(v ?? "").replace(/[^0-9.-]/g, "")
+    String(value ?? "")
+      .replace(/[^0-9.-]/g, "")
   );
 
   return Number.isFinite(n) ? n : 0;
 }
 
+
+/* =========================
+   CHECK REQUEST STATUS
+========================= */
+
 function pending(data) {
-  const s = String(
+
+  const status = String(
     pick(
       data,
       ["status", "requestStatus", "state"],
       "pending"
     )
   ).toLowerCase();
+
 
   return ![
     "approved",
@@ -97,18 +168,31 @@ function pending(data) {
     "failed",
     "cancelled",
     "canceled"
-  ].includes(s);
+  ].includes(status);
 }
 
+
+/* =========================
+   CREATE REQUEST OBJECT
+========================= */
+
 function makeRequest(key, data) {
+
   return {
+
     key,
+
     data,
 
     userId: String(
       pick(
         data,
-        ["userId", "uid", "user_id", "userid"],
+        [
+          "userId",
+          "uid",
+          "user_id",
+          "userid"
+        ],
         ""
       )
     ),
@@ -143,7 +227,11 @@ function makeRequest(key, data) {
     amount: num(
       pick(
         data,
-        ["amount", "money", "requestAmount"],
+        [
+          "amount",
+          "money",
+          "requestAmount"
+        ],
         0
       )
     ),
@@ -163,21 +251,42 @@ function makeRequest(key, data) {
         ""
       )
     )
+
   };
 }
 
-async function findUser(req) {
-  const snap = await db.ref("users").once("value");
-  const users = snap.val() || {};
 
-  if (req.userId && users[req.userId]) {
+/* =========================
+   FIND USER
+========================= */
+
+async function findUser(req) {
+
+  const snap =
+    await db.ref("users").once("value");
+
+  const users =
+    snap.val() || {};
+
+
+  if (
+    req.userId &&
+    users[req.userId]
+  ) {
+
     return {
       key: req.userId,
       data: users[req.userId]
     };
+
   }
 
-  for (const [key, data] of Object.entries(users)) {
+
+  for (
+    const [key, data]
+    of Object.entries(users)
+  ) {
+
     const mobile = String(
       pick(
         data,
@@ -192,372 +301,32 @@ async function findUser(req) {
       )
     );
 
-    if (req.mobile && mobile === req.mobile) {
-      return {
-        key,
-        data
-      };
-    }
-  }
 
-  return null;
-}
-
-function wallet(data) {
-  return num(
-    pick(
-      data,
-      [
-        "balance",
-        "wallet",
-        "walletBalance",
-        "money"
-      ],
-      0
-    )
-  );
-}
-
-function alertMessage(req) {
-  const embed = new EmbedBuilder()
-    .setTitle("💰 NEW ADD MONEY REQUEST")
-    .addFields(
-      {
-        name: "👤 Name",
-        value: req.name || "Not provided",
-        inline: true
-      },
-      {
-        name: "📱 Mobile",
-        value: req.mobile || "Not provided",
-        inline: true
-      },
-      {
-        name: "💵 Amount",
-        value: `₹${req.amount.toFixed(2)}`,
-        inline: true
-      },
-      {
-        name: "🔖 UTR / Reference",
-        value: req.utr || "Not provided"
-      },
-      {
-        name: "🆔 Request ID",
-        value: String(req.key)
-      }
-    )
-    .setTimestamp();
-
-  const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`ACCEPT:${req.key}`)
-      .setLabel("ACCEPT")
-      .setStyle(ButtonStyle.Success),
-
-    new ButtonBuilder()
-      .setCustomId(`REJECT:${req.key}`)
-      .setLabel("REJECT")
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  return {
-    embeds: [embed],
-    components: [buttons]
-  };
-}
-
-async function getChannel() {
-  for (const guild of client.guilds.cache.values()) {
-    const channel = guild.channels.cache.find(
-      (c) =>
-        c.isTextBased() &&
-        c.name === CHANNEL_NAME
-    );
-
-    if (channel) {
-      return channel;
-    }
-  }
-
-  return null;
-}
-
-const sentRequests = new Set();
-
-async function sendRequest(snapshot) {
-  if (!snapshot.exists()) return;
-
-  const data = snapshot.val() || {};
-  const key = snapshot.key;
-
-  if (!pending(data)) return;
-
-  if (sentRequests.has(key)) return;
-
-  const req = makeRequest(key, data);
-
-  if (req.amount <= 0) return;
-
-  const channel = await getChannel();
-
-  if (!channel) {
-    console.log(
-      "add-money-alert channel not found"
-    );
-    return;
-  }
-
-  await channel.send(
-    alertMessage(req)
-  );
-
-  sentRequests.add(key);
-
-  console.log(
-    "New Add Money alert:",
-    key
-  );
-}
-
-async function acceptRequest(
-  key,
-  interaction
-) {
-  const requestRef =
-    db.ref(`add_history/${key}`);
-
-  const snap =
-    await requestRef.once("value");
-
-  if (!snap.exists()) {
-    throw new Error(
-      "Request not found."
-    );
-  }
-
-  const data = snap.val() || {};
-
-  if (!pending(data)) {
-    return {
-      ok: false,
-      message:
-        "This request was already processed."
-    };
-  }
-
-  const req =
-    makeRequest(key, data);
-
-  if (req.amount <= 0) {
-    throw new Error(
-      "Invalid amount."
-    );
-const admin = require("firebase-admin");
-const {
-  Client,
-  GatewayIntentBits,
-  Events,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder
-} = require("discord.js");
-
-const TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_NAME = "add-money-alert";
-const DATABASE_URL =
-  "https://zoya-recharge-2-default-rtdb.firebaseio.com";
-
-if (!TOKEN) {
-  console.error("DISCORD_TOKEN is missing");
-  process.exit(1);
-}
-
-if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-  console.error("FIREBASE_SERVICE_ACCOUNT_JSON is missing");
-  process.exit(1);
-}
-
-let serviceAccount;
-
-try {
-  serviceAccount = JSON.parse(
-    process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-  );
-
-  // Firebase private key में escaped \n को real newline में बदलना
-  if (serviceAccount.private_key) {
-    serviceAccount.private_key =
-      serviceAccount.private_key.replace(/\\n/g, "\n");
-  }
-} catch (error) {
-  console.error(
-    "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON:",
-    error.message
-  );
-  process.exit(1);
-}
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: DATABASE_URL
-});
-
-const db = admin.database();
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
-
-function pick(obj, keys, fallback = "") {
-  for (const key of keys) {
     if (
-      obj &&
-      obj[key] !== undefined &&
-      obj[key] !== null &&
-      String(obj[key]).trim() !== ""
+      req.mobile &&
+      mobile === req.mobile
     ) {
-      return obj[key];
-    }
-  }
 
-  return fallback;
-}
-
-function num(v) {
-  const n = Number(
-    String(v ?? "").replace(/[^0-9.-]/g, "")
-  );
-
-  return Number.isFinite(n) ? n : 0;
-}
-
-function pending(data) {
-  const s = String(
-    pick(
-      data,
-      ["status", "requestStatus", "state"],
-      "pending"
-    )
-  ).toLowerCase();
-
-  return ![
-    "approved",
-    "accepted",
-    "success",
-    "successful",
-    "rejected",
-    "declined",
-    "failed",
-    "cancelled",
-    "canceled"
-  ].includes(s);
-}
-
-function makeRequest(key, data) {
-  return {
-    key,
-    data,
-
-    userId: String(
-      pick(
-        data,
-        ["userId", "uid", "user_id", "userid"],
-        ""
-      )
-    ),
-
-    mobile: String(
-      pick(
-        data,
-        [
-          "mobile",
-          "phone",
-          "number",
-          "mobileNumber",
-          "phoneNumber"
-        ],
-        ""
-      )
-    ),
-
-    name: String(
-      pick(
-        data,
-        [
-          "name",
-          "userName",
-          "username",
-          "customerName"
-        ],
-        ""
-      )
-    ),
-
-    amount: num(
-      pick(
-        data,
-        ["amount", "money", "requestAmount"],
-        0
-      )
-    ),
-
-    utr: String(
-      pick(
-        data,
-        [
-          "utr",
-          "UTR",
-          "utrNumber",
-          "reference",
-          "referenceNumber",
-          "transactionId",
-          "txnId"
-        ],
-        ""
-      )
-    )
-  };
-}
-
-async function findUser(req) {
-  const snap = await db.ref("users").once("value");
-  const users = snap.val() || {};
-
-  if (req.userId && users[req.userId]) {
-    return {
-      key: req.userId,
-      data: users[req.userId]
-    };
-  }
-
-  for (const [key, data] of Object.entries(users)) {
-    const mobile = String(
-      pick(
-        data,
-        [
-          "mobile",
-          "phone",
-          "number",
-          "mobileNumber",
-          "phoneNumber"
-        ],
-        ""
-      )
-    );
-
-    if (req.mobile && mobile === req.mobile) {
       return {
         key,
         data
       };
+
     }
+
   }
+
 
   return null;
 }
 
+
+/* =========================
+   WALLET
+========================= */
+
 function wallet(data) {
+
   return num(
     pick(
       data,
@@ -570,1023 +339,803 @@ function wallet(data) {
       0
     )
   );
+
 }
+
+
+/* =========================
+   DISCORD MESSAGE
+========================= */
 
 function alertMessage(req) {
-  const embed = new EmbedBuilder()
-    .setTitle("💰 NEW ADD MONEY REQUEST")
-    .addFields(
-      {
-        name: "👤 Name",
-        value: req.name || "Not provided",
-        inline: true
-      },
-      {
-        name: "📱 Mobile",
-        value: req.mobile || "Not provided",
-        inline: true
-      },
-      {
-        name: "💵 Amount",
-        value: `₹${req.amount.toFixed(2)}`,
-        inline: true
-      },
-      {
-        name: "🔖 UTR / Reference",
-        value: req.utr || "Not provided"
-      },
-      {
-        name: "🆔 Request ID",
-        value: String(req.key)
-      }
-    )
-    .setTimestamp();
 
-  const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`ACCEPT:${req.key}`)
-      .setLabel("ACCEPT")
-      .setStyle(ButtonStyle.Success),
+  const embed =
+    new EmbedBuilder()
 
-    new ButtonBuilder()
-      .setCustomId(`REJECT:${req.key}`)
-      .setLabel("REJECT")
-      .setStyle(ButtonStyle.Danger)
-  );
+      .setTitle(
+        "💰 NEW ADD MONEY REQUEST"
+      )
+
+      .addFields(
+
+        {
+          name: "👤 Name",
+          value:
+            req.name ||
+            "Not provided",
+          inline: true
+        },
+
+        {
+          name: "📱 Mobile",
+          value:
+            req.mobile ||
+            "Not provided",
+          inline: true
+        },
+
+        {
+          name: "💵 Amount",
+          value:
+            `₹${req.amount.toFixed(2)}`,
+          inline: true
+        },
+
+        {
+          name: "🔖 UTR / Reference",
+          value:
+            req.utr ||
+            "Not provided"
+        },
+
+        {
+          name: "🆔 Request ID",
+          value:
+            String(req.key)
+        }
+
+      )
+
+      .setTimestamp();
+
+
+  const buttons =
+    new ActionRowBuilder()
+      .addComponents(
+
+        new ButtonBuilder()
+          .setCustomId(
+            `ACCEPT:${req.key}`
+          )
+          .setLabel("ACCEPT")
+          .setStyle(
+            ButtonStyle.Success
+          ),
+
+        new ButtonBuilder()
+          .setCustomId(
+            `REJECT:${req.key}`
+          )
+          .setLabel("REJECT")
+          .setStyle(
+            ButtonStyle.Danger
+          )
+
+      );
+
 
   return {
+
     embeds: [embed],
-    components: [buttons]
+
+    components: [
+      buttons
+    ]
+
   };
+
 }
 
+
+/* =========================
+   FIND DISCORD CHANNEL
+========================= */
+
 async function getChannel() {
-  for (const guild of client.guilds.cache.values()) {
-    const channel = guild.channels.cache.find(
-      (c) =>
-        c.isTextBased() &&
-        c.name === CHANNEL_NAME
-    );
+
+  for (
+    const guild
+    of client.guilds.cache.values()
+  ) {
+
+    const channel =
+      guild.channels.cache.find(
+        (c) =>
+          c.isTextBased() &&
+          c.name === CHANNEL_NAME
+      );
+
 
     if (channel) {
       return channel;
     }
+
   }
+
 
   return null;
 }
 
-const sentRequests = new Set();
+
+/* =========================
+   PREVENT DUPLICATE ALERTS
+========================= */
+
+const sentRequests =
+  new Set();
+
+
+/* =========================
+   SEND REQUEST TO DISCORD
+========================= */
 
 async function sendRequest(snapshot) {
-  if (!snapshot.exists()) return;
 
-  const data = snapshot.val() || {};
-  const key = snapshot.key;
-
-  if (!pending(data)) return;
-
-  if (sentRequests.has(key)) return;
-
-  const req = makeRequest(key, data);
-
-  if (req.amount <= 0) return;
-
-  const channel = await getChannel();
-
-  if (!channel) {
-    console.log(
-      "add-money-alert channel not found"
-    );
+  if (
+    !snapshot ||
+    !snapshot.exists()
+  ) {
     return;
   }
 
-  await channel.send(
-    alertMessage(req)
-  );
+
+  const data =
+    snapshot.val() || {};
+
+  const key =
+    snapshot.key;
+
+
+  if (!pending(data)) {
+    return;
+  }
+
+
+  if (sentRequests.has(key)) {
+    return;
+  }
+
+
+  const req =
+    makeRequest(
+      key,
+      data
+    );
+
+
+  if (req.amount <= 0) {
+    return;
+  }
+
+
+  const channel =
+    await getChannel();
+
+
+  if (!channel) {
+
+    console.log(
+      `Channel "${CHANNEL_NAME}" not found.`
+    );
+
+    return;
+  }
+
 
   sentRequests.add(key);
 
-  console.log(
-    "New Add Money alert:",
-    key
-  );
+
+  try {
+
+    await channel.send(
+      alertMessage(req)
+    );
+
+    console.log(
+      "New Add Money alert:",
+      key
+    );
+
+  } catch (error) {
+
+    sentRequests.delete(key);
+
+    console.error(
+      "Discord message failed:",
+      error.message
+    );
+
+  }
+
 }
 
-async function acceptRequest(
+
+/* =========================
+   CLAIM REQUEST
+========================= */
+
+async function claimRequest(
   key,
   interaction
 ) {
+
   const requestRef =
-    db.ref(`add_history/${key}`);
-
-  const snap =
-    await requestRef.once("value");
-
-  if (!snap.exists()) {
-    throw new Error(
-      "Request not found."
+    db.ref(
+      `add_history/${key}`
     );
-  }
 
-  const data = snap.val() || {};
-
-  if (!pending(data)) {
-    return {
-      ok: false,
-      message:
-        "This request was already processed."
-    };
-  }
-
-  const req =
-    makeRequest(key, data);
-
-  if (req.amount <= 0) {
-    throw new Error(
-      "Invalid amount."
-    );
-  }
-
-  const user =
-    await findUser(req);
-
-  if (!user) {
-    throw new Error(
-      "User not found in Firebase."
-    );
-  }
-
-  const userRef =
-    db.ref(`users/${user.key}`);
 
   const result =
-    await userRef.transaction(
+    await requestRef.transaction(
       (current) => {
+
         if (!current) {
           return current;
         }
 
-        const oldBalance =
-          wallet(current);
 
-        const newBalance =
-          oldBalance + req.amount;
+        const status =
+          String(
+            pick(
+              current,
+              [
+                "status",
+                "requestStatus",
+                "state"
+              ],
+              "pending"
+            )
+          ).toLowerCase();
+
+
+        if (
+          [
+            "approved",
+            "accepted",
+            "success",
+            "successful",
+            "rejected",
+            "declined",
+            "failed",
+            "cancelled",
+            "canceled",
+            "processing"
+          ].includes(status)
+        ) {
+
+          return;
+
+        }
+
 
         return {
+
           ...current,
-          balance: newBalance,
-          wallet: newBalance
+
+          status:
+            "processing",
+
+          processingBy:
+            interaction.user.tag,
+
+          processingAt:
+            admin.database.ServerValue.TIMESTAMP
+
         };
+
       }
     );
 
+
   if (!result.committed) {
+    return null;
+  }
+
+
+  return result.snapshot.val();
+
+}
+
+
+/* =========================
+   ACCEPT REQUEST
+========================= */
+
+async function acceptRequest(
+  key,
+  interaction
+) {
+
+  const requestRef =
+    db.ref(
+      `add_history/${key}`
+    );
+
+
+  const claimedData =
+    await claimRequest(
+      key,
+      interaction
+    );
+
+
+  if (!claimedData) {
+
+    return {
+
+      ok: false,
+
+      message:
+        "This request was already processed."
+
+    };
+
+  }
+
+
+  const req =
+    makeRequest(
+      key,
+      claimedData
+    );
+
+
+  if (req.amount <= 0) {
+
+    await requestRef.update({
+      status: "failed"
+    });
+
+    throw new Error(
+      "Invalid amount."
+    );
+
+  }
+
+
+  const user =
+    await findUser(req);
+
+
+  if (!user) {
+
+    await requestRef.update({
+
+      status:
+        "pending",
+
+      error:
+        "User not found in Firebase."
+
+    });
+
+
+    throw new Error(
+      "User not found in Firebase."
+    );
+
+  }
+
+
+  const userRef =
+    db.ref(
+      `users/${user.key}`
+    );
+
+
+  const result =
+    await userRef.transaction(
+      (current) => {
+
+        if (!current) {
+          return current;
+        }
+
+
+        const oldBalance =
+          wallet(current);
+
+
+        const newBalance =
+          oldBalance +
+          req.amount;
+
+
+        return {
+
+          ...current,
+
+          balance:
+            newBalance,
+
+          wallet:
+            newBalance
+
+        };
+
+      }
+    );
+
+
+  if (!result.committed) {
+
+    await requestRef.update({
+      status: "pending"
+    });
+
+
     throw new Error(
       "Wallet update failed."
     );
+
   }
 
+
   await requestRef.update({
-    status: "approved",
-    approvedAmount: req.amount,
-    approvedBy: interaction.user.tag,
+
+    status:
+      "approved",
+
+    approvedAmount:
+      req.amount,
+
+    approvedBy:
+      interaction.user.tag,
+
     processedAt:
       admin.database.ServerValue.TIMESTAMP
+
   });
 
+
   return {
+
     ok: true,
-    amount: req.amount
+
+    amount:
+      req.amount
+
   };
+
 }
+
+
+/* =========================
+   REJECT REQUEST
+========================= */
 
 async function rejectRequest(
   key,
   interaction
 ) {
+
   const ref =
-    db.ref(`add_history/${key}`);
+    db.ref(
+      `add_history/${key}`
+    );
 
-  const snap =
-    await ref.once("value");
 
-  if (!snap.exists()) {
-    return false;
-  }
+  const result =
+    await ref.transaction(
+      (current) => {
 
-  const data =
-    snap.val() || {};
+        if (!current) {
+          return current;
+        }
 
-  if (!pending(data)) {
-    return false;
-  }
 
-  await ref.update({
-    status: "rejected",
-    rejectedBy: interaction.user.tag,
-    processedAt:
-      admin.database.ServerValue.TIMESTAMP
-  });
+        const status =
+          String(
+            pick(
+              current,
+              [
+                "status",
+                "requestStatus",
+                "state"
+              ],
+              "pending"
+            )
+          ).toLowerCase();
 
-  return true;
+
+        if (
+          [
+            "approved",
+            "accepted",
+            "success",
+            "successful",
+            "rejected",
+            "declined",
+            "failed",
+            "cancelled",
+            "canceled",
+            "processing"
+          ].includes(status)
+        ) {
+
+          return;
+
+        }
+
+
+        return {
+
+          ...current,
+
+          status:
+            "rejected",
+
+          rejectedBy:
+            interaction.user.tag,
+
+          processedAt:
+            admin.database.ServerValue.TIMESTAMP
+
+        };
+
+      }
+    );
+
+
+  return result.committed;
+
 }
+
+
+/* =========================
+   BOT READY
+========================= */
 
 client.once(
   Events.ClientReady,
   async (bot) => {
+
     console.log(
       `Discord bot online: ${bot.user.tag}`
     );
 
+
     const ref =
-      db.ref("add_history");
+      db.ref(
+        "add_history"
+      );
+
 
     const existing =
-      await ref.once("value");
+      await ref.once(
+        "value"
+      );
+
 
     const data =
       existing.val() || {};
+
 
     for (
       const [key, value]
       of Object.entries(data)
     ) {
+
       await sendRequest({
+
         exists: () => true,
+
         key,
+
         val: () => value
+
       });
+
     }
+
 
     ref.on(
       "child_added",
       sendRequest
     );
 
+
     console.log(
       "Watching Firebase /add_history"
     );
+
   }
 );
+
+
+/* =========================
+   BUTTON HANDLER
+========================= */
 
 client.on(
   Events.InteractionCreate,
   async (interaction) => {
+
     if (!interaction.isButton()) {
       return;
     }
 
-    const parts =
-      interaction.customId.split(":");
 
-    const action = parts[0];
+    const parts =
+      interaction.customId
+        .split(":");
+
+
+    const action =
+      parts[0];
+
 
     const key =
-      parts.slice(1).join(":");
+      parts
+        .slice(1)
+        .join(":");
 
-    if (!key) return;
+
+    if (!key) {
+      return;
+    }
+
 
     await interaction.deferUpdate();
 
+
     try {
-      if (action === "ACCEPT") {
+
+      /* ACCEPT */
+
+      if (
+        action === "ACCEPT"
+      ) {
+
         const result =
           await acceptRequest(
             key,
             interaction
           );
 
+
         if (!result.ok) {
+
           await interaction.editReply({
+
             content:
               `⚠️ ${result.message}`,
+
             embeds: [],
+
             components: []
+
           });
 
           return;
+
         }
+
 
         await interaction.editReply({
+
           content:
-            `✅ ACCEPTED\n₹${result.amount.toFixed(2)} wallet में add हो गया।`,
+            `✅ ACCEPTED\n₹${result.amount.toFixed(
+              2
+            )} wallet में add हो गया।`,
+
           embeds: [],
+
           components: []
+
         });
 
-        return;
-      }
-
-      if (action === "REJECT") {
-        const ok =
-          await rejectRequest(
-       const admin = require("firebase-admin");
-const {
-  Client,
-  GatewayIntentBits,
-  Events,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder
-} = require("discord.js");
-
-const TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_NAME = "add-money-alert";
-const DATABASE_URL =
-  "https://zoya-recharge-2-default-rtdb.firebaseio.com";
-
-if (!TOKEN) {
-  console.error("DISCORD_TOKEN is missing");
-  process.exit(1);
-}
-
-if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-  console.error("FIREBASE_SERVICE_ACCOUNT_JSON is missing");
-  process.exit(1);
-}
-
-let serviceAccount;
-
-try {
-  serviceAccount = JSON.parse(
-    process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-  );
-
-  // Firebase private key में escaped \n को real newline में बदलना
-  if (serviceAccount.private_key) {
-    serviceAccount.private_key =
-      serviceAccount.private_key.replace(/\\n/g, "\n");
-  }
-} catch (error) {
-  console.error(
-    "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON:",
-    error.message
-  );
-  process.exit(1);
-}
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: DATABASE_URL
-});
-
-const db = admin.database();
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
-
-function pick(obj, keys, fallback = "") {
-  for (const key of keys) {
-    if (
-      obj &&
-      obj[key] !== undefined &&
-      obj[key] !== null &&
-      String(obj[key]).trim() !== ""
-    ) {
-      return obj[key];
-    }
-  }
-
-  return fallback;
-}
-
-function num(v) {
-  const n = Number(
-    String(v ?? "").replace(/[^0-9.-]/g, "")
-  );
-
-  return Number.isFinite(n) ? n : 0;
-}
-
-function pending(data) {
-  const s = String(
-    pick(
-      data,
-      ["status", "requestStatus", "state"],
-      "pending"
-    )
-  ).toLowerCase();
-
-  return ![
-    "approved",
-    "accepted",
-    "success",
-    "successful",
-    "rejected",
-    "declined",
-    "failed",
-    "cancelled",
-    "canceled"
-  ].includes(s);
-}
-
-function makeRequest(key, data) {
-  return {
-    key,
-    data,
-
-    userId: String(
-      pick(
-        data,
-        ["userId", "uid", "user_id", "userid"],
-        ""
-      )
-    ),
-
-    mobile: String(
-      pick(
-        data,
-        [
-          "mobile",
-          "phone",
-          "number",
-          "mobileNumber",
-          "phoneNumber"
-        ],
-        ""
-      )
-    ),
-
-    name: String(
-      pick(
-        data,
-        [
-          "name",
-          "userName",
-          "username",
-          "customerName"
-        ],
-        ""
-      )
-    ),
-
-    amount: num(
-      pick(
-        data,
-        ["amount", "money", "requestAmount"],
-        0
-      )
-    ),
-
-    utr: String(
-      pick(
-        data,
-        [
-          "utr",
-          "UTR",
-          "utrNumber",
-          "reference",
-          "referenceNumber",
-          "transactionId",
-          "txnId"
-        ],
-        ""
-      )
-    )
-  };
-}
-
-async function findUser(req) {
-  const snap = await db.ref("users").once("value");
-  const users = snap.val() || {};
-
-  if (req.userId && users[req.userId]) {
-    return {
-      key: req.userId,
-      data: users[req.userId]
-    };
-  }
-
-  for (const [key, data] of Object.entries(users)) {
-    const mobile = String(
-      pick(
-        data,
-        [
-          "mobile",
-          "phone",
-          "number",
-          "mobileNumber",
-          "phoneNumber"
-        ],
-        ""
-      )
-    );
-
-    if (req.mobile && mobile === req.mobile) {
-      return {
-        key,
-        data
-      };
-    }
-  }
-
-  return null;
-}
-
-function wallet(data) {
-  return num(
-    pick(
-      data,
-      [
-        "balance",
-        "wallet",
-        "walletBalance",
-        "money"
-      ],
-      0
-    )
-  );
-}
-
-function alertMessage(req) {
-  const embed = new EmbedBuilder()
-    .setTitle("💰 NEW ADD MONEY REQUEST")
-    .addFields(
-      {
-        name: "👤 Name",
-        value: req.name || "Not provided",
-        inline: true
-      },
-      {
-        name: "📱 Mobile",
-        value: req.mobile || "Not provided",
-        inline: true
-      },
-      {
-        name: "💵 Amount",
-        value: `₹${req.amount.toFixed(2)}`,
-        inline: true
-      },
-      {
-        name: "🔖 UTR / Reference",
-        value: req.utr || "Not provided"
-      },
-      {
-        name: "🆔 Request ID",
-        value: String(req.key)
-      }
-    )
-    .setTimestamp();
-
-  const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`ACCEPT:${req.key}`)
-      .setLabel("ACCEPT")
-      .setStyle(ButtonStyle.Success),
-
-    new ButtonBuilder()
-      .setCustomId(`REJECT:${req.key}`)
-      .setLabel("REJECT")
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  return {
-    embeds: [embed],
-    components: [buttons]
-  };
-}
-
-async function getChannel() {
-  for (const guild of client.guilds.cache.values()) {
-    const channel = guild.channels.cache.find(
-      (c) =>
-        c.isTextBased() &&
-        c.name === CHANNEL_NAME
-    );
-
-    if (channel) {
-      return channel;
-    }
-  }
-
-  return null;
-}
-
-const sentRequests = new Set();
-
-async function sendRequest(snapshot) {
-  if (!snapshot.exists()) return;
-
-  const data = snapshot.val() || {};
-  const key = snapshot.key;
-
-  if (!pending(data)) return;
-
-  if (sentRequests.has(key)) return;
-
-  const req = makeRequest(key, data);
-
-  if (req.amount <= 0) return;
-
-  const channel = await getChannel();
-
-  if (!channel) {
-    console.log(
-      "add-money-alert channel not found"
-    );
-    return;
-  }
-
-  await channel.send(
-    alertMessage(req)
-  );
-
-  sentRequests.add(key);
-
-  console.log(
-    "New Add Money alert:",
-    key
-  );
-}
-
-async function acceptRequest(
-  key,
-  interaction
-) {
-  const requestRef =
-    db.ref(`add_history/${key}`);
-
-  const snap =
-    await requestRef.once("value");
-
-  if (!snap.exists()) {
-    throw new Error(
-      "Request not found."
-    );
-  }
-
-  const data = snap.val() || {};
-
-  if (!pending(data)) {
-    return {
-      ok: false,
-      message:
-        "This request was already processed."
-    };
-  }
-
-  const req =
-    makeRequest(key, data);
-
-  if (req.amount <= 0) {
-    throw new Error(
-      "Invalid amount."
-    );
-  }
-
-  const user =
-    await findUser(req);
-
-  if (!user) {
-    throw new Error(
-      "User not found in Firebase."
-    );
-  }
-
-  const userRef =
-    db.ref(`users/${user.key}`);
-
-  const result =
-    await userRef.transaction(
-      (current) => {
-        if (!current) {
-          return current;
-        }
-
-        const oldBalance =
-          wallet(current);
-
-        const newBalance =
-          oldBalance + req.amount;
-
-        return {
-          ...current,
-          balance: newBalance,
-          wallet: newBalance
-        };
-      }
-    );
-
-  if (!result.committed) {
-    throw new Error(
-      "Wallet update failed."
-    );
-  }
-
-  await requestRef.update({
-    status: "approved",
-    approvedAmount: req.amount,
-    approvedBy: interaction.user.tag,
-    processedAt:
-      admin.database.ServerValue.TIMESTAMP
-  });
-
-  return {
-    ok: true,
-    amount: req.amount
-  };
-}
-
-async function rejectRequest(
-  key,
-  interaction
-) {
-  const ref =
-    db.ref(`add_history/${key}`);
-
-  const snap =
-    await ref.once("value");
-
-  if (!snap.exists()) {
-    return false;
-  }
-
-  const data =
-    snap.val() || {};
-
-  if (!pending(data)) {
-    return false;
-  }
-
-  await ref.update({
-    status: "rejected",
-    rejectedBy: interaction.user.tag,
-    processedAt:
-      admin.database.ServerValue.TIMESTAMP
-  });
-
-  return true;
-}
-
-client.once(
-  Events.ClientReady,
-  async (bot) => {
-    console.log(
-      `Discord bot online: ${bot.user.tag}`
-    );
-
-    const ref =
-      db.ref("add_history");
-
-    const existing =
-      await ref.once("value");
-
-    const data =
-      existing.val() || {};
-
-    for (
-      const [key, value]
-      of Object.entries(data)
-    ) {
-      await sendRequest({
-        exists: () => true,
-        key,
-        val: () => value
-      });
-    }
-
-    ref.on(
-      "child_added",
-      sendRequest
-    );
-
-    console.log(
-      "Watching Firebase /add_history"
-    );
-  }
-);
-
-client.on(
-  Events.InteractionCreate,
-  async (interaction) => {
-    if (!interaction.isButton()) {
-      return;
-    }
-
-    const parts =
-      interaction.customId.split(":");
-
-    const action = parts[0];
-
-    const key =
-      parts.slice(1).join(":");
-
-    if (!key) return;
-
-    await interaction.deferUpdate();
-
-    try {
-      if (action === "ACCEPT") {
-        const result =
-          await acceptRequest(
-            key,
-            interaction
-          );
-
-        if (!result.ok) {
-          await interaction.editReply({
-            content:
-              `⚠️ ${result.message}`,
-            embeds: [],
-            components: []
-          });
-
-          return;
-        }
-
-        await interaction.editReply({
-          content:
-            `✅ ACCEPTED\n₹${result.amount.toFixed(2)} wallet में add हो गया।`,
-          embeds: [],
-          components: []
-        });
 
         return;
+
       }
 
-      if (action === "REJECT") {
+
+      /* REJECT */
+
+      if (
+        action === "REJECT"
+      ) {
+
         const ok =
           await rejectRequest(
             key,
             interaction
           );
 
+
         await interaction.editReply({
-          content: ok
-            ? "❌ REJECTED — Add Money request reject कर दी गई।"
-            : "⚠️ यह request पहले ही process हो चुकी है।",
+
+          content:
+            ok
+              ? "❌ REJECTED — Add Money request reject कर दी गई।"
+              : "⚠️ यह request पहले ही process हो चुकी है।",
+
           embeds: [],
+
           components: []
+
         });
+
       }
+
     } catch (error) {
+
       console.error(error);
+
 
       await interaction
         .editReply({
+
           content:
             `⚠️ Error: ${error.message}`,
+
           embeds: [],
+
           components: []
+
         })
         .catch(() => {});
+
     }
+
   }
 );
+
+
+/* =========================
+   ERROR HANDLERS
+========================= */
 
 process.on(
   "unhandledRejection",
-  console.error
+  (error) => {
+
+    console.error(
+      "Unhandled rejection:",
+      error
+    );
+
+  }
 );
+
 
 process.on(
   "uncaughtException",
-  console.error
-);
+  (error) => {
 
-client.login(TOKEN     key,
-            interaction
-          );
+    console.error(
+      "Uncaught exception:",
+      error
+    );
 
-        await interaction.editReply({
-          content: ok
-            ? "❌ REJECTED — Add Money request reject कर दी गई।"
-            : "⚠️ यह request पहले ही process हो चुकी है।",
-          embeds: [],
-          components: []
-        });
-      }
-    } catch (error) {
-      console.error(error);
-
-      await interaction
-        .editReply({
-          content:
-            `⚠️ Error: ${error.message}`,
-          embeds: [],
-          components: []
-        })
-        .catch(() => {});
-    }
   }
 );
 
-process.on(
-  "unhandledRejection",
-  console.error
-);
 
-process.on(
-  "uncaughtException",
-  console.error
-);
+/* =========================
+   LOGIN
+========================= */
 
-client.login(TOKEN);  }
+client
+  .login(TOKEN)
+  .catch((error) => {
 
-  const user =
-    await findUser(req);
-
-  if (!user) {
-    throw new Error(
-      "User not found in Firebase."
-    );
-  }
-
-  const userRef =
-    db.ref(`users/${user.key}`);
-
-  const result =
-    await userRef.transaction(
-      (current) => {
-        if (!current) {
-          return current;
-        }
-
-        const oldBalance =
-          wallet(current);
-
-        const newBalance =
-          oldBalance + req.amount;
-
-        return {
-          ...current,
-          balance: newBalance,
-          wallet: newBalance
-        };
-      }
+    console.error(
+      "Discord login failed:",
+      error.message
     );
 
-  if (!result.committed) {
-    throw new Error(
-      "Wallet update failed."
-    );
-  }
+    process.exit(1);
 
-  await requestRef.update({
-    status: "approved",
-    approvedAmount: req.amount,
-    approvedBy: interaction.user.tag,
-    processedAt:
-      admin.database.ServerValue.TIMESTAMP
   });
-
-  return {
-    ok: true,
-    amount: req.amount
-  };
-}
-
-async function rejectRequest(
-  key,
-  interaction
-) {
-  const ref =
-    db.ref(`add_history/${key}`);
-
-  const snap =
-    await ref.once("value");
-
-  if (!snap.exists()) {
-    return false;
-  }
-
-  const data =
-    snap.val() || {};
-
-  if (!pending(data)) {
-    return false;
-  }
-
-  await ref.update({
-    status: "rejected",
-    rejectedBy: interaction.user.tag,
-    processedAt:
-      admin.database.ServerValue.TIMESTAMP
-  });
-
-  return true;
-}
-
-client.once(
-  Events.ClientReady,
-  async (bot) => {
-    console.log(
-      `Discord bot online: ${bot.user.tag}`
-    );
-
-    const ref =
-      db.ref("add_history");
-
-    const existing =
-      await ref.once("value");
-
-    const data =
-      existing.val() || {};
-
-    for (
-      const [key, value]
-      of Object.entries(data)
-    ) {
